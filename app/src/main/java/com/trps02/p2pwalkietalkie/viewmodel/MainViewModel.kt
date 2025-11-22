@@ -8,13 +8,11 @@ import android.content.ServiceConnection
 import android.net.wifi.p2p.WifiP2pDevice
 import android.net.wifi.p2p.WifiP2pInfo
 import android.os.IBinder
-import android.widget.Toast
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.trps02.p2pwalkietalkie.WalkieTalkieService
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -22,24 +20,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var walkieTalkieService: WalkieTalkieService? = null
     private var isBound = false
 
-    // 저장소 (관리자 키 저장용)
-    private val prefs = application.getSharedPreferences("WalkieTalkiePrefs", Context.MODE_PRIVATE)
-    private val KEY_ADMIN_CARD_ID = "admin_card_id"
-
-    // --- 상태 변수들 ---
-    private val _peers = MutableStateFlow<List<WifiP2pDevice>>(emptyList())
-    val peers: StateFlow<List<WifiP2pDevice>> = _peers.asStateFlow()
-
-    private val _connectionInfo = MutableStateFlow<WifiP2pInfo?>(null)
-    val connectionInfo: StateFlow<WifiP2pInfo?> = _connectionInfo.asStateFlow()
-
-    // 현재 UI 잠금 상태 (true면 조작 불가)
-    private val _isLocked = MutableStateFlow(false)
-    val isLocked: StateFlow<Boolean> = _isLocked.asStateFlow()
-
-    // 관리자 키 등록 모드인지 여부
-    private val _isRegisteringCard = MutableStateFlow(false)
-    val isRegisteringCard: StateFlow<Boolean> = _isRegisteringCard.asStateFlow()
+    val peers = AppState.peers
+    val connectionInfo = AppState.connectionInfo
+    val isLocked = AppState.isLocked
+    val isRegisteringCard = AppState.isRegisteringCard
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
@@ -47,6 +31,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             walkieTalkieService = binder.getService()
             isBound = true
             collectServiceState()
+            startAutoDiscovery()
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
@@ -55,59 +40,44 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    // ▼▼▼ 자동 탐색 로직 수정됨 ▼▼▼
+    private fun startAutoDiscovery() {
+        viewModelScope.launch {
+            while (isActive) {
+                val info = AppState.connectionInfo.value
+                val isConnected = info?.groupFormed == true
+                val isGroupOwner = info?.isGroupOwner == true
+
+                // 1. 연결 안 됐으면 무조건 탐색
+                // 2. 연결 됐더라도 내가 '방장(Group Owner)'이면 탐색 유지 (그래야 새 멤버가 찾음)
+                if (!isConnected || isGroupOwner) {
+                    walkieTalkieService?.discoverPeers()
+                }
+
+                // 방장일 때는 오디오 끊김 방지를 위해 탐색 간격을 좀 더 길게(15초) 둠
+                val delayTime = if (isGroupOwner) 15000L else 10000L
+                delay(delayTime)
+            }
+        }
+    }
+    // ▲▲▲ 자동 탐색 로직 수정됨 ▲▲▲
+
     private fun collectServiceState() {
         viewModelScope.launch {
-            walkieTalkieService?.peers?.collect { _peers.value = it }
+            walkieTalkieService?.peers?.collect { AppState.updatePeers(it) }
         }
         viewModelScope.launch {
-            walkieTalkieService?.connectionInfo?.collect { info ->
-                _connectionInfo.value = info
-                // 연결이 성립되면 자동으로 잠금 모드 진입
-                if (info?.groupFormed == true) {
-                    _isLocked.value = true
-                } else {
-                    _isLocked.value = false
-                }
-            }
+            walkieTalkieService?.connectionInfo?.collect { AppState.updateConnectionInfo(it) }
         }
     }
 
-    // --- NFC 카드 처리 로직 ---
+    fun onNfcTagScanned(tagId: String) {
+        AppState.onNfcTagScanned(getApplication(), tagId)
+    }
 
     fun setRegisteringMode(isRegistering: Boolean) {
-        _isRegisteringCard.value = isRegistering
+        AppState.setRegisteringMode(isRegistering)
     }
-
-    // NFC 태그가 감지되었을 때 호출됨 (MainActivity에서 호출)
-    fun onNfcTagScanned(tagId: String) {
-        if (_isRegisteringCard.value) {
-            // 1. 등록 모드: 카드 ID 저장
-            prefs.edit().putString(KEY_ADMIN_CARD_ID, tagId).apply()
-            Toast.makeText(getApplication(), "관리자 키 등록 완료!", Toast.LENGTH_SHORT).show()
-            _isRegisteringCard.value = false
-        } else {
-            // 2. 일반 모드: 관리자 키 확인
-            val adminId = prefs.getString(KEY_ADMIN_CARD_ID, null)
-            if (adminId == tagId) {
-                if (_connectionInfo.value?.groupFormed == true) {
-                    // 연결 상태라면 잠금 토글 (해제 <-> 잠금)
-                    _isLocked.value = !_isLocked.value
-                    val msg = if (_isLocked.value) "다시 잠김" else "관리자 권한: 잠금 해제됨"
-                    Toast.makeText(getApplication(), msg, Toast.LENGTH_SHORT).show()
-                } else {
-                    Toast.makeText(getApplication(), "인증된 관리자 카드입니다.", Toast.LENGTH_SHORT).show()
-                }
-            } else {
-                Toast.makeText(getApplication(), "등록되지 않은 카드입니다.", Toast.LENGTH_SHORT).show()
-            }
-        }
-    }
-
-    fun hasRegisteredKey(): Boolean {
-        return prefs.contains(KEY_ADMIN_CARD_ID)
-    }
-
-    // --- 기존 기능들 ---
 
     fun bindService() {
         if (!isBound) {

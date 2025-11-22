@@ -9,6 +9,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.ServiceInfo
 import android.net.NetworkInfo
 import android.net.wifi.p2p.WifiP2pConfig
 import android.net.wifi.p2p.WifiP2pDevice
@@ -18,11 +19,16 @@ import android.os.Binder
 import android.os.Build
 import android.os.IBinder
 import android.os.Looper
+import android.util.Log
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
-@SuppressLint("MissingPermission")
+@SuppressLint("MissingPermission", "ForegroundServiceType")
 class WalkieTalkieService : Service() {
 
     private val TAG = "WalkieTalkieService"
@@ -44,7 +50,8 @@ class WalkieTalkieService : Service() {
 
     private var audioStreamManager: AudioStreamManager? = null
 
-    // UI에 공개할 상태
+    private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+
     private val _peers = MutableStateFlow<List<WifiP2pDevice>>(emptyList())
     val peers: StateFlow<List<WifiP2pDevice>> = _peers.asStateFlow()
 
@@ -53,6 +60,7 @@ class WalkieTalkieService : Service() {
 
     private val connectionInfoListener = WifiP2pManager.ConnectionInfoListener { info ->
         if (info.groupFormed) {
+            Log.d(TAG, "Connection established.")
             startAudioStreamer(info)
         }
         _connectionInfo.value = info
@@ -65,6 +73,7 @@ class WalkieTalkieService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        Log.d(TAG, "Service onCreate")
         wifiP2pManager = getSystemService(Context.WIFI_P2P_SERVICE) as WifiP2pManager
         initializeChannel()
         setupIntentFilter()
@@ -72,11 +81,26 @@ class WalkieTalkieService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        startForeground(NOTIFICATION_ID, createNotification("무전기 대기 중..."))
+        Log.d(TAG, "Service onStartCommand")
+
+        val notification = createNotification("무전기 대기 중...")
+
+        if (Build.VERSION.SDK_INT >= 34) {
+            startForeground(
+                NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+            )
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
+
         return START_STICKY
     }
 
     override fun onDestroy() {
+        Log.d(TAG, "Service onDestroy")
+        serviceScope.cancel()
         unregisterReceiver()
         stopAudioStreamer()
         super.onDestroy()
@@ -135,8 +159,8 @@ class WalkieTalkieService : Service() {
     fun discoverPeers() {
         channel?.let {
             wifiP2pManager.discoverPeers(it, object : WifiP2pManager.ActionListener {
-                override fun onSuccess() {}
-                override fun onFailure(reason: Int) {}
+                override fun onSuccess() { Log.d(TAG, "Discovery Started") }
+                override fun onFailure(reason: Int) { Log.e(TAG, "Discovery Failed: $reason") }
             })
         }
     }
@@ -145,16 +169,17 @@ class WalkieTalkieService : Service() {
         if (channel == null) return
         val config = WifiP2pConfig().apply { this.deviceAddress = deviceAddress }
         wifiP2pManager.connect(channel, config, object : WifiP2pManager.ActionListener {
-            override fun onSuccess() {}
-            override fun onFailure(reason: Int) {}
+            override fun onSuccess() { Log.d(TAG, "Connection Init Success") }
+            override fun onFailure(reason: Int) { Log.e(TAG, "Connection Init Failed: $reason") }
         })
     }
 
     fun disconnect() {
         if (channel != null) {
             wifiP2pManager.removeGroup(channel, object : WifiP2pManager.ActionListener {
-                override fun onSuccess() {}
+                override fun onSuccess() { Log.d(TAG, "Group Removed") }
                 override fun onFailure(reason: Int) {
+                    Log.e(TAG, "Remove Group Failed: $reason")
                     _connectionInfo.value = null
                     stopAudioStreamer()
                 }
@@ -165,9 +190,14 @@ class WalkieTalkieService : Service() {
         }
     }
 
+    fun getChannel(): WifiP2pManager.Channel? {
+        return channel
+    }
+
     private fun startAudioStreamer(info: WifiP2pInfo) {
         if (audioStreamManager != null) return
 
+        Log.d(TAG, "Starting Audio Streamer")
         audioStreamManager = AudioStreamManager(info).apply {
             startServerAndReceiver()
         }
@@ -175,6 +205,7 @@ class WalkieTalkieService : Service() {
     }
 
     private fun stopAudioStreamer() {
+        Log.d(TAG, "Stopping Audio Streamer")
         audioStreamManager?.disconnect()
         audioStreamManager = null
         updateNotification("무전기 대기 중...")
